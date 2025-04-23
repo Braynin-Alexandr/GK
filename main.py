@@ -19,6 +19,7 @@ holidays = [
     "2023-06-10", "2023-06-11", "2023-06-12",
     "2023-11-04", "2023-11-05", "2023-11-06"
 ]
+holiday_dates = np.array(holidays, dtype='datetime64[D]')
 
 
 def convert_to_datetime(date: str) -> datetime:
@@ -26,14 +27,12 @@ def convert_to_datetime(date: str) -> datetime:
     return datetime.strptime(date, '%d.%m.%Y %H:%M:%S')
 
 
-def count_weekdays(start_date: str, end_date: str, holiday_dates: list=None) -> int:
+def count_weekdays(start_date, end_date, holiday_dates) -> int:
     """Count the number of weekdays between start_date and end_date, excluding holidays"""
     if not isinstance(start_date, datetime):
         start_date = convert_to_datetime(start_date)
     if not isinstance(end_date, datetime):
         end_date = convert_to_datetime(end_date)
-
-    holiday_dates = holiday_dates or []
 
     return int(np.busday_count(
         start_date.date().strftime('%Y-%m-%d'),
@@ -53,43 +52,73 @@ def update_order_info(order_info: dict, stage: str, status: str, work_days: int)
     order_info[stage][status] += work_days
 
 
-def get_order_info(order: pd.Series) -> dict[str, dict[str:int]]:
+def parse_history_entries(text: str) -> list[dict]:
+    """Parses the order history line by line and returns a list of entries with date, stage, and status"""
+    lines = text.splitlines()
+    date_pattern = re.compile(r'^(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}) (.+)$')
+
+    entries = []
+    i = 0
+    while i < len(lines):
+        match = date_pattern.match(lines[i])
+        if match:
+            date_str, stage = match.groups()
+            date = datetime.strptime(date_str, "%d.%m.%Y %H:%M:%S")
+
+            status_lines = []
+            i += 1
+            while i < len(lines) and not date_pattern.match(lines[i]):
+                if lines[i].strip():
+                    status_lines.append(lines[i].strip())
+                i += 1
+
+            status = " ".join(status_lines) if status_lines else ''
+            entries.append({
+                "datetime": date,
+                "stage": stage.strip(),
+                "status": status
+            })
+        else:
+            i += 1
+
+    return entries
+
+
+def get_order_info(order: pd.Series) -> dict[str, dict[str, int]]:
     """Extract and process information from an order's history"""
     text = order['История']
-    re_pattern = r'(?P<date>\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}) (?P<stage>[^\n]+)(?:\n(?P<status>.*?))?(?=\n\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}|\Z)'
-    matches = list(re.finditer(re_pattern, text))
-
-    if not matches:
-        return {}
+    entries = parse_history_entries(text)
 
     result = {}
-    for i in range(len(matches)-1):
-        current = matches[i]
-        next_match = matches[i + 1]
+    for i in range(len(entries) - 1):
+        current = entries[i]
+        next_entry = entries[i + 1]
 
-        stage = current.group("stage").strip()
-        status = current.group("status").strip() if current.group("status") else ''
-        start_date = current.group("date")
-        finish_date = next_match.group("date")
-        work_days = count_weekdays(start_date, finish_date, holidays)
+        stage = current["stage"]
+        status = current["status"]
+        start_date = current["datetime"]
+        end_date = next_entry["datetime"]
+        work_days = count_weekdays(start_date, end_date, holiday_dates)
 
         update_order_info(result, stage, status, work_days)
 
-    last_stage = matches[-1].group("stage").strip()
-    last_status = matches[-1].group("status").strip() if matches[-1].group("status") else ''
-    update_order_info(result, last_stage, last_status, 0)
+    if entries:
+        last_entry = entries[-1]
+        update_order_info(result, last_entry["stage"], last_entry["status"], 0)
 
     return result
 
 
-def get_status_info(order: dict, group_name: str, status_group: list) -> dict:
+def sum_workdays_for_statuses(order: dict, group_name: str, status_group: list) -> dict:
     """Extracts and calculates the total workdays for each status in the given status_group for a specific order"""
     group_data = order.get(group_name, {})
-    status_days = {status: 0 for status in status_group}
+    status_days = {}
 
     for status_name, days in group_data.items():
         for target in status_group:
             if status_name.startswith(target):
+                if target not in status_days:
+                    status_days[target] = 0
                 status_days[target] += days
                 break
 
@@ -100,13 +129,14 @@ all_results = []
 for _, row in df.iterrows():
     order_number = row['Номер закупки']
     order_info = get_order_info(row)
-    statuses_info = get_status_info(order_info, target_stage, target_statuses)
+    statuses_info = sum_workdays_for_statuses(order_info, target_stage, target_statuses)
     order_result = {'Номер закупки': order_number} | statuses_info
     all_results.append(order_result)
 
 
 try:
     new_df = pd.DataFrame(all_results)
+    new_df = new_df[['Номер закупки'] + target_statuses]
     new_df.to_excel('Report.xlsx', index=False)
 except Exception as e:
     print(f'Something went wrong: {e}')
